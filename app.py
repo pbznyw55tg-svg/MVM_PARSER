@@ -560,6 +560,16 @@ def parsing_thread(urls, task_id=None, save_to_db=True):
                 Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
                 Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru']});
             """)
+            context.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Referer': 'https://www.mvideo.ru/',
+            })
+            context.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                'Referer': 'https://www.mvideo.ru/',
+            })
             context.add_cookies([
                 {'name': 'MVID_CITY_ID', 'value': 'CityCZ_975', 'domain': '.mvideo.ru', 'path': '/'},
                 {'name': 'MVID_REGION_SHOP', 'value': 'S002', 'domain': '.mvideo.ru', 'path': '/'}
