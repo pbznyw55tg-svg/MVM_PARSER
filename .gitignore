@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.db
+data/
+downloads/
+last_result.json
+fullchain.crt
+cert.key
