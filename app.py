@@ -425,8 +425,8 @@ def add_status(task, msg):
         with tasks_lock:
             task['messages'].append(msg)
 
-def parse_seller_page_final(context, seller_url, task=None):
-    # Перебираем user-agent'ы, если получаем 403
+def parse_seller_page_final(browser, seller_url, task=None):
+    """Полный цикл с автоматической сменой User-Agent при 403 и улучшенной загрузкой всех товаров."""
     for ua in USER_AGENTS:
         context = browser.new_context(
             user_agent=ua,
@@ -452,32 +452,31 @@ def parse_seller_page_final(context, seller_url, task=None):
 
         page = context.new_page()
         try:
-            add_status(task, f"Попытка загрузить {seller_url} с User-Agent: {ua[:50]}...")
+            add_status(task, f"Пробуем User-Agent: {ua[:50]}...")
             resp = page.goto(seller_url, wait_until='load', timeout=30000)
             if resp.status == 403:
-                log_error("Получен 403, пробуем следующий User-Agent")
+                log_error("403 – пробуем следующий User-Agent")
                 page.close()
                 continue
             if resp.status >= 400:
-                log_error(f"Сайт вернул ошибку {resp.status}: {resp.status_text}")
+                log_error(f"Ошибка {resp.status}: {resp.status_text}")
                 page.close()
                 return None
-            # Успешно – выходим из цикла по user-agent'ам
+            # Успех – выходим из цикла
             break
         except Exception as e:
-            log_error(f"Ошибка при загрузке: {e}")
+            log_error(f"Ошибка загрузки: {e}")
             page.close()
             continue
     else:
-        # Если ни один агент не сработал
         log_error("Все User-Agent'ы заблокированы")
         return None
 
-    # Дальше уже успешно загруженная страница
+    # Дальше идёт обычная логика с кнопкой «Показать ещё»
     try:
         page.wait_for_selector('a[href*="/products/"]', timeout=20000)
     except:
-        add_status(task, "Товары не появились, страница пустая")
+        add_status(task, "Товары не появились")
         page.close()
         return []
 
@@ -486,21 +485,19 @@ def parse_seller_page_final(context, seller_url, task=None):
     no_change_streak = 0
 
     while clicks < max_clicks:
-        # Дополнительный скроллинг перед поиском кнопки для стабильности
         page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
         page.wait_for_timeout(3000)
         button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
         if not button or not button.is_visible():
-            # Ещё раз прокрутим и подождём
             page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
             page.wait_for_timeout(2000)
             button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
             if not button or not button.is_visible():
-                add_status(task, "Кнопка «Показать ещё» больше не найдена")
+                add_status(task, "Кнопка не найдена")
                 break
 
         prev_count = page.evaluate('document.querySelectorAll(\'a[href*="/products/"]\').length')
-        add_status(task, f"Клик {clicks+1}, товаров сейчас: {prev_count}")
+        add_status(task, f"Клик {clicks+1}, товаров: {prev_count}")
 
         button.scroll_into_view_if_needed()
         try:
@@ -518,7 +515,7 @@ def parse_seller_page_final(context, seller_url, task=None):
             page.wait_for_timeout(2000)
             no_change_streak += 1
             if no_change_streak >= 3:
-                add_status(task, "3 раза количество не изменилось, завершаем загрузку")
+                add_status(task, "3 раза без изменений – выход")
                 break
 
         clicks += 1
@@ -593,13 +590,65 @@ def parsing_thread(urls, task_id=None, save_to_db=True):
                     '--disable-features=IsolateOrigins,site-per-process',
                 ]
             )
-            # Контекст браузера создаётся внутри parse_seller_page_final,
-            # поэтому здесь просто используем browser без контекста.
-            # Но для передачи browser в parse_seller_page_final нужно слегка изменить сигнатуру.
-            # Упростим: будем создавать контекст в этой функции и передавать его в parse_seller_page_final,
-            # но тогда нужно переделать цикл по user-agent'ам здесь.
-            # Вместо этого оставим browser, а parse_seller_page_final перепишем, чтобы получать browser.
-            pass
+            all_data = []
+            for seller_url in urls:
+                add_status(task, f"Обрабатывается магазин: {seller_url}")
+                products = parse_seller_page_final(browser, seller_url, task)
+                if products is None:
+                    log_error(f"Сайт заблокировал доступ для {seller_url}")
+                    continue
+                if not products:
+                    continue
+                if task:
+                    with tasks_lock:
+                        task['total'] += len(products)
+                add_status(task, f"Найдено {len(products)} товаров, начинаем запись")
+
+                if save_to_db:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("DELETE FROM sellers WHERE seller_url = ?;", (seller_url,))
+                    conn.commit()
+                    conn.close()
+
+                for prod in products:
+                    if task:
+                        with tasks_lock:
+                            task['current_link'] = prod['link']
+                            task['completed'] += 1
+                    all_data.append({
+                        'Код товара': prod['productId'],
+                        'Цена': prod['price'] if prod['price'] != "N/A" else "N/A",
+                        'Ссылка на товар': prod['link'],
+                        'Магазин': seller_url
+                    })
+                    if save_to_db and prod['productId'] != "N/A":
+                        save_seller_product(seller_url, prod['productId'])
+                        if isinstance(prod['price'], int):
+                            save_price(prod['productId'], prod['price'])
+            browser.close()
+            if task:
+                with tasks_lock:
+                    task['result'] = all_data
+                    task['success'] = True
+            if save_to_db:
+                clean_old_prices()
+                save_parsing_result(all_data, len(all_data))
+            add_status(task, f"Парсинг завершён. Всего товаров: {len(all_data)}")
+            global previous_result
+            with open(previous_file, 'w', encoding='utf-8') as f:
+                json.dump(all_data, f, ensure_ascii=False, indent=2)
+            previous_result = all_data
+    except Exception as e:
+        log_error(f"Глобальная ошибка: {e}")
+        traceback.print_exc()
+        if task:
+            with tasks_lock:
+                task['success'] = False
+    finally:
+        if task:
+            with tasks_lock:
+                task['running'] = False
 
 # ===== Планировщик (каждые 6 часов) =====
 def run_schedule():
@@ -608,8 +657,6 @@ def run_schedule():
         time.sleep(1)
 
 def scheduled_parse():
-    if parsing_status.get('running'):
-        return
     sellers = get_all_sellers()
     if sellers:
         print("Автоматический парсинг запущен для", len(sellers), "продавцов.")
@@ -623,26 +670,24 @@ def index():
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         if not urls:
             return jsonify({'status': 'error', 'message': 'Введите хотя бы одну ссылку.'})
-        if not parsing_status.get('running'):
-            task_id = str(uuid.uuid4())
-            task = {
-                'running': True,
-                'total': 0,
-                'completed': 0,
-                'start_time': time.time(),
-                'current_link': '',
-                'messages': [],
-                'result': [],
-                'success': False
-            }
-            with tasks_lock:
-                tasks[task_id] = task
-            thread = threading.Thread(target=parsing_thread, args=(urls, task_id, True))
-            thread.daemon = True
-            thread.start()
-            return jsonify({'status': 'started', 'task_id': task_id})
-        else:
-            return jsonify({'status': 'error', 'message': 'Парсинг уже выполняется.'})
+        # Проверяем, нет ли уже запущенной задачи (можно разрешить несколько, но оставим просто)
+        task_id = str(uuid.uuid4())
+        task = {
+            'running': True,
+            'total': 0,
+            'completed': 0,
+            'start_time': time.time(),
+            'current_link': '',
+            'messages': [],
+            'result': [],
+            'success': False
+        }
+        with tasks_lock:
+            tasks[task_id] = task
+        thread = threading.Thread(target=parsing_thread, args=(urls, task_id, True))
+        thread.daemon = True
+        thread.start()
+        return jsonify({'status': 'started', 'task_id': task_id})
     sellers = get_all_sellers()
     history = get_parsing_history(100)
     total_all, total_24h = get_total_stats()
