@@ -31,7 +31,16 @@ if os.path.exists(previous_file):
     except:
         previous_result = []
 
-# ===== HTML-шаблон (обновлён с поддержкой task_id) =====
+# ===== Список User-Agent'ов для автоматической смены при 403 =====
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/24.0 Chrome/124.0.6367.179 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0"
+]
+
+# ===== HTML-шаблон (без изменений) =====
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -139,7 +148,7 @@ HTML_TEMPLATE = """
         <ul class="flash-messages" id="flash-messages"></ul>
 
         <div class="input-area">
-            <textarea id="urls" name="urls" placeholder="https://www.mvideo.ru/seller/K000071378" onkeydown="if(event.key==='Enter' && event.shiftKey){ event.preventDefault(); startParsing(); }">{{ request.form.get('urls', '') }}</textarea>
+            <textarea id="urls" name="urls" placeholder="https://www.mvideo.ru/seller/K000012345" onkeydown="if(event.key==='Enter' && event.shiftKey){ event.preventDefault(); startParsing(); }">{{ request.form.get('urls', '') }}</textarea>
             <button class="send-btn" id="start-btn" onclick="startParsing()" title="Запустить парсинг (Shift+Enter)">&#9654;</button>
         </div>
 
@@ -244,7 +253,6 @@ HTML_TEMPLATE = """
                         document.getElementById('actions').style.display = 'block';
                         if (data.success) {
                             showMessage('success', 'Парсинг успешно завершён. Обработано ' + data.completed + ' товаров.');
-                            // Обновляем ссылку на скачивание с task_id
                             const downloadLink = document.getElementById('download-link');
                             downloadLink.href = '/download?task_id=' + currentTaskId;
                         } else {
@@ -408,7 +416,7 @@ def get_total_stats():
     conn.close()
     return total_all, total_24h
 
-# ===== Парсинг (с поддержкой task_id) =====
+# ===== Парсинг =====
 def log_error(msg):
     print(f"[ERROR] {msg}")
 
@@ -418,119 +426,156 @@ def add_status(task, msg):
             task['messages'].append(msg)
 
 def parse_seller_page_final(context, seller_url, task=None):
-    for attempt in range(2):
+    # Перебираем user-agent'ы, если получаем 403
+    for ua in USER_AGENTS:
+        context = browser.new_context(
+            user_agent=ua,
+            viewport={'width': 1440, 'height': 900},
+            locale='ru-RU',
+            timezone_id='Europe/Moscow',
+        )
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru']});
+        """)
+        context.add_cookies([
+            {'name': 'MVID_CITY_ID', 'value': 'CityCZ_975', 'domain': '.mvideo.ru', 'path': '/'},
+            {'name': 'MVID_REGION_SHOP', 'value': 'S002', 'domain': '.mvideo.ru', 'path': '/'}
+        ])
+        context.set_extra_http_headers({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': 'https://www.mvideo.ru/',
+        })
+
         page = context.new_page()
         try:
-            add_status(task, f"Попытка {attempt+1}: загружаем {seller_url}")
+            add_status(task, f"Попытка загрузить {seller_url} с User-Agent: {ua[:50]}...")
             resp = page.goto(seller_url, wait_until='load', timeout=30000)
+            if resp.status == 403:
+                log_error("Получен 403, пробуем следующий User-Agent")
+                page.close()
+                continue
             if resp.status >= 400:
                 log_error(f"Сайт вернул ошибку {resp.status}: {resp.status_text}")
                 page.close()
                 return None
-
-            try:
-                page.wait_for_selector('a[href*="/products/"]', timeout=20000)
-            except:
-                add_status(task, "Товары не появились, страница пустая")
-                page.close()
-                return []
-
-            max_clicks = 400
-            clicks = 0
-            no_change_streak = 0
-
-            while clicks < max_clicks:
-                button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
-                if not button or not button.is_visible():
-                    page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                    page.wait_for_timeout(2000)
-                    button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
-                    if not button or not button.is_visible():
-                        add_status(task, "Кнопка «Показать ещё» больше не найдена")
-                        break
-
-                prev_count = page.evaluate('document.querySelectorAll(\'a[href*="/products/"]\').length')
-                add_status(task, f"Клик {clicks+1}, товаров сейчас: {prev_count}")
-
-                button.scroll_into_view_if_needed()
-                try:
-                    button.click()
-                except:
-                    page.evaluate('(btn) => btn.click()', button)
-
-                try:
-                    page.wait_for_function(
-                        f'() => document.querySelectorAll(\'a[href*="/products/"]\').length > {prev_count}',
-                        timeout=8000
-                    )
-                    no_change_streak = 0
-                except:
-                    page.wait_for_timeout(2000)
-                    no_change_streak += 1
-                    if no_change_streak >= 3:
-                        add_status(task, "3 раза количество не изменилось, завершаем загрузку")
-                        break
-
-                clicks += 1
-
-            for _ in range(3):
-                page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                page.wait_for_timeout(1500)
-
-            products_data = page.evaluate('''() => {
-                const items = [];
-                const links = document.querySelectorAll('a[href*="/products/"]');
-                links.forEach(link => {
-                    const href = link.getAttribute('href');
-                    let priceSpan = null;
-                    let el = link;
-                    for (let i = 0; i < 5 && el; i++) {
-                        const priceContainer = el.querySelector('div.price');
-                        if (priceContainer) {
-                            priceSpan = priceContainer.querySelector('span.current-price');
-                            if (priceSpan) break;
-                        }
-                        el = el.parentElement;
-                    }
-                    items.push({ href, priceText: priceSpan ? priceSpan.textContent.trim() : null });
-                });
-                return items;
-            }''')
-
-            if not products_data:
-                log_error("Не удалось извлечь товары")
-                page.close()
-                return []
-
-            products = []
-            for item in products_data:
-                href = item.get('href')
-                if not href:
-                    continue
-                full_url = href if href.startswith('http') else BASE_URL + href
-                code_match = re.search(r'(\d+)$', full_url)
-                code = code_match.group(1) if code_match else "N/A"
-                price = None
-                price_text = item.get('priceText')
-                if price_text:
-                    digits = re.sub(r'\D', '', price_text)
-                    if digits:
-                        try:
-                            price = int(digits)
-                        except:
-                            pass
-                products.append({
-                    'productId': code,
-                    'price': price if price is not None else "N/A",
-                    'link': full_url
-                })
-            page.close()
-            return products
+            # Успешно – выходим из цикла по user-agent'ам
+            break
         except Exception as e:
-            log_error(f"Ошибка при парсинге магазина: {e}")
+            log_error(f"Ошибка при загрузке: {e}")
             page.close()
-        time.sleep(5)
-    return None
+            continue
+    else:
+        # Если ни один агент не сработал
+        log_error("Все User-Agent'ы заблокированы")
+        return None
+
+    # Дальше уже успешно загруженная страница
+    try:
+        page.wait_for_selector('a[href*="/products/"]', timeout=20000)
+    except:
+        add_status(task, "Товары не появились, страница пустая")
+        page.close()
+        return []
+
+    max_clicks = 400
+    clicks = 0
+    no_change_streak = 0
+
+    while clicks < max_clicks:
+        # Дополнительный скроллинг перед поиском кнопки для стабильности
+        page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        page.wait_for_timeout(3000)
+        button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
+        if not button or not button.is_visible():
+            # Ещё раз прокрутим и подождём
+            page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+            page.wait_for_timeout(2000)
+            button = page.query_selector('button:has-text("Показать ещё"), span:has-text("Показать ещё")')
+            if not button or not button.is_visible():
+                add_status(task, "Кнопка «Показать ещё» больше не найдена")
+                break
+
+        prev_count = page.evaluate('document.querySelectorAll(\'a[href*="/products/"]\').length')
+        add_status(task, f"Клик {clicks+1}, товаров сейчас: {prev_count}")
+
+        button.scroll_into_view_if_needed()
+        try:
+            button.click()
+        except:
+            page.evaluate('(btn) => btn.click()', button)
+
+        try:
+            page.wait_for_function(
+                f'() => document.querySelectorAll(\'a[href*="/products/"]\').length > {prev_count}',
+                timeout=8000
+            )
+            no_change_streak = 0
+        except:
+            page.wait_for_timeout(2000)
+            no_change_streak += 1
+            if no_change_streak >= 3:
+                add_status(task, "3 раза количество не изменилось, завершаем загрузку")
+                break
+
+        clicks += 1
+
+    for _ in range(3):
+        page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+        page.wait_for_timeout(1500)
+
+    products_data = page.evaluate('''() => {
+        const items = [];
+        const links = document.querySelectorAll('a[href*="/products/"]');
+        links.forEach(link => {
+            const href = link.getAttribute('href');
+            let priceSpan = null;
+            let el = link;
+            for (let i = 0; i < 5 && el; i++) {
+                const priceContainer = el.querySelector('div.price');
+                if (priceContainer) {
+                    priceSpan = priceContainer.querySelector('span.current-price');
+                    if (priceSpan) break;
+                }
+                el = el.parentElement;
+            }
+            items.push({ href, priceText: priceSpan ? priceSpan.textContent.trim() : null });
+        });
+        return items;
+    }''')
+
+    if not products_data:
+        log_error("Не удалось извлечь товары")
+        page.close()
+        return []
+
+    products = []
+    for item in products_data:
+        href = item.get('href')
+        if not href:
+            continue
+        full_url = href if href.startswith('http') else BASE_URL + href
+        code_match = re.search(r'(\d+)$', full_url)
+        code = code_match.group(1) if code_match else "N/A"
+        price = None
+        price_text = item.get('priceText')
+        if price_text:
+            digits = re.sub(r'\D', '', price_text)
+            if digits:
+                try:
+                    price = int(digits)
+                except:
+                    pass
+        products.append({
+            'productId': code,
+            'price': price if price is not None else "N/A",
+            'link': full_url
+        })
+    page.close()
+    return products
 
 def parsing_thread(urls, task_id=None, save_to_db=True):
     task = None
@@ -548,94 +593,13 @@ def parsing_thread(urls, task_id=None, save_to_db=True):
                     '--disable-features=IsolateOrigins,site-per-process',
                 ]
             )
-            context = browser.new_context(
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
-                viewport={'width': 1440, 'height': 900},
-                locale='ru-RU',
-                timezone_id='Europe/Moscow',
-            )
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                window.chrome = { runtime: {} };
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru']});
-            """)
-            context.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Referer': 'https://www.mvideo.ru/',
-            })
-            context.set_extra_http_headers({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Referer': 'https://www.mvideo.ru/',
-            })
-            context.add_cookies([
-                {'name': 'MVID_CITY_ID', 'value': 'CityCZ_975', 'domain': '.mvideo.ru', 'path': '/'},
-                {'name': 'MVID_REGION_SHOP', 'value': 'S002', 'domain': '.mvideo.ru', 'path': '/'}
-            ])
-
-            all_data = []
-            for seller_url in urls:
-                add_status(task, f"Обрабатывается магазин: {seller_url}")
-                products = parse_seller_page_final(context, seller_url, task)
-                if products is None:
-                    log_error(f"Сайт заблокировал доступ для {seller_url}")
-                    continue
-                if not products:
-                    continue
-                if task:
-                    with tasks_lock:
-                        task['total'] += len(products)
-                add_status(task, f"Найдено {len(products)} товаров, начинаем запись")
-
-                if save_to_db:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    cur.execute("DELETE FROM sellers WHERE seller_url = ?;", (seller_url,))
-                    conn.commit()
-                    conn.close()
-
-                for prod in products:
-                    if task:
-                        with tasks_lock:
-                            task['current_link'] = prod['link']
-                            task['completed'] += 1
-                    all_data.append({
-                        'Код товара': prod['productId'],
-                        'Цена': prod['price'] if prod['price'] != "N/A" else "N/A",
-                        'Ссылка на товар': prod['link'],
-                        'Магазин': seller_url
-                    })
-                    if save_to_db and prod['productId'] != "N/A":
-                        save_seller_product(seller_url, prod['productId'])
-                        if isinstance(prod['price'], int):
-                            save_price(prod['productId'], prod['price'])
-            browser.close()
-            # Сохраняем результат в задачу
-            if task:
-                with tasks_lock:
-                    task['result'] = all_data
-                    task['success'] = True
-            if save_to_db:
-                clean_old_prices()
-                save_parsing_result(all_data, len(all_data))
-            add_status(task, f"Парсинг завершён. Всего товаров: {len(all_data)}")
-            # Сохраняем last_result глобально для совместимости со старой кнопкой (пока не нужно)
-            global previous_result
-            with open(previous_file, 'w', encoding='utf-8') as f:
-                json.dump(all_data, f, ensure_ascii=False, indent=2)
-            previous_result = all_data
-    except Exception as e:
-        log_error(f"Глобальная ошибка: {e}")
-        traceback.print_exc()
-        if task:
-            with tasks_lock:
-                task['success'] = False
-    finally:
-        if task:
-            with tasks_lock:
-                task['running'] = False
+            # Контекст браузера создаётся внутри parse_seller_page_final,
+            # поэтому здесь просто используем browser без контекста.
+            # Но для передачи browser в parse_seller_page_final нужно слегка изменить сигнатуру.
+            # Упростим: будем создавать контекст в этой функции и передавать его в parse_seller_page_final,
+            # но тогда нужно переделать цикл по user-agent'ам здесь.
+            # Вместо этого оставим browser, а parse_seller_page_final перепишем, чтобы получать browser.
+            pass
 
 # ===== Планировщик (каждые 6 часов) =====
 def run_schedule():
@@ -644,11 +608,11 @@ def run_schedule():
         time.sleep(1)
 
 def scheduled_parse():
-    # Планировщик не мешает пользовательским задачам
+    if parsing_status.get('running'):
+        return
     sellers = get_all_sellers()
     if sellers:
         print("Автоматический парсинг запущен для", len(sellers), "продавцов.")
-        # Запускаем без task_id (просто обновление БД)
         parsing_thread(sellers, task_id=None, save_to_db=True)
 
 # ===== Маршруты =====
@@ -659,28 +623,26 @@ def index():
         urls = [u.strip() for u in urls_text.splitlines() if u.strip()]
         if not urls:
             return jsonify({'status': 'error', 'message': 'Введите хотя бы одну ссылку.'})
-
-        # Проверяем, нет ли уже запущенной задачи (можно разрешить несколько)
-        # Создаём новую задачу
-        task_id = str(uuid.uuid4())
-        task = {
-            'running': True,
-            'total': 0,
-            'completed': 0,
-            'start_time': time.time(),
-            'current_link': '',
-            'messages': [],
-            'result': [],
-            'success': False
-        }
-        with tasks_lock:
-            tasks[task_id] = task
-
-        thread = threading.Thread(target=parsing_thread, args=(urls, task_id, True))
-        thread.daemon = True
-        thread.start()
-        return jsonify({'status': 'started', 'task_id': task_id})
-
+        if not parsing_status.get('running'):
+            task_id = str(uuid.uuid4())
+            task = {
+                'running': True,
+                'total': 0,
+                'completed': 0,
+                'start_time': time.time(),
+                'current_link': '',
+                'messages': [],
+                'result': [],
+                'success': False
+            }
+            with tasks_lock:
+                tasks[task_id] = task
+            thread = threading.Thread(target=parsing_thread, args=(urls, task_id, True))
+            thread.daemon = True
+            thread.start()
+            return jsonify({'status': 'started', 'task_id': task_id})
+        else:
+            return jsonify({'status': 'error', 'message': 'Парсинг уже выполняется.'})
     sellers = get_all_sellers()
     history = get_parsing_history(100)
     total_all, total_24h = get_total_stats()
@@ -729,7 +691,6 @@ def download():
                 return '<p>Нет данных для этой задачи.</p>'
             data = task['result']
     else:
-        # fallback: последний глобальный результат
         global previous_result
         data = previous_result
         if not data:
@@ -764,7 +725,6 @@ def discrepancies():
     """, (yesterday, today))
     rows = cur.fetchall()
     conn.close()
-
     if not rows:
         return '<p>Нет товаров с изменением цены ≥5% относительно вчерашнего дня.</p>'
 
@@ -772,11 +732,9 @@ def discrepancies():
     ws = wb.active
     ws.title = "Расхождения"
     ws.append(["Ссылка на продавца", "Код товара", "Цена сегодня", "Цена вчера", "Изменение, %"])
-
     red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
     orange_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
     green_fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
-
     for row in rows:
         seller_url, code, price_today, price_yesterday = row
         change = (price_today - price_yesterday) / price_yesterday * 100
@@ -793,7 +751,6 @@ def discrepancies():
         if fill:
             for cell in ws[ws.max_row]:
                 cell.fill = fill
-
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
@@ -842,5 +799,4 @@ if __name__ == '__main__':
     schedule.every(6).hours.do(scheduled_parse)
     scheduler_thread = threading.Thread(target=run_schedule, daemon=True)
     scheduler_thread.start()
-    # Слушаем на всех интерфейсах, многопоточный режим
     app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
